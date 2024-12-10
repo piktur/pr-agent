@@ -20,8 +20,12 @@ VERSION=0.2.4
 IMAGE_SUFFIX=$GITHUB_USER/$GITHUB_REPO/$ENVIRONMENT_NAME/$PACKAGE_NAME
 
 # Set registry and perform login based on registry type
-
 REGISTRY=$AWS_REGISTRY
+
+# AWS SSO login
+aws sso login --profile=production --sso-session=piktur
+
+# Docker login
 aws ecr get-login-password --region "$(aws configure get region)" | docker login $AWS_REGISTRY -u AWS --password-stdin
 
 # Create repository if it doesn't exist
@@ -45,6 +49,7 @@ docker build \
     --tag $IMAGE_NAME:serverless \
     --build-arg LAMBDA_TASK_ROOT=/var/task \
     --file docker/Dockerfile.lambda \
+    --push \
     .
 
 docker push $IMAGE_NAME:serverless

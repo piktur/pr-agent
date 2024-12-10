@@ -8,6 +8,7 @@ import traceback
 from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
+import base64
 
 from github import AppAuthentication, Auth, Github
 from retry import retry
@@ -686,7 +687,7 @@ class GithubProvider(GitProvider):
 
         if deployment_type == 'app':
             try:
-                private_key = get_settings().github.private_key.replace('\\n', '\n')
+                private_key = base64.b64decode(get_settings().github.private_key).decode('utf-8')
                 app_id = get_settings().github.app_id
             except AttributeError as e:
                 raise ValueError("GitHub app ID and private key are required when using GitHub app deployment") from e
