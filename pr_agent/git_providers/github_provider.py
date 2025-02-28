@@ -5,12 +5,13 @@ import itertools
 import re
 import time
 import traceback
+import json
 from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 import base64
 
-from github import AppAuthentication, Auth, Github
+from github import AppAuthentication, Auth, Github, GithubException
 from retry import retry
 from starlette_context import context
 
@@ -20,7 +21,7 @@ from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE
 from ..algo.utils import (PRReviewHeader, Range, clip_tokens,
                           find_line_number_of_relevant_line_in_file,
-                          load_large_diff)
+                          load_large_diff, set_file_languages)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
@@ -175,6 +176,24 @@ class GithubProvider(GitProvider):
 
             diff_files = []
             invalid_files_names = []
+            is_close_to_rate_limit = False
+
+            # The base.sha will point to the current state of the base branch (including parallel merges), not the original base commit when the PR was created
+            # We can fix this by finding the merge base commit between the PR head and base branches
+            # Note that The pr.head.sha is actually correct as is - it points to the latest commit in your PR branch.
+            # This SHA isn't affected by parallel merges to the base branch since it's specific to your PR's branch.
+            repo = self.repo_obj
+            pr = self.pr
+            try:
+                compare = repo.compare(pr.base.sha, pr.head.sha) # communication with GitHub
+                merge_base_commit = compare.merge_base_commit
+            except Exception as e:
+                get_logger().error(f"Failed to get merge base commit: {e}")
+                merge_base_commit = pr.base
+            if merge_base_commit.sha != pr.base.sha:
+                get_logger().info(
+                    f"Using merge base commit {merge_base_commit.sha} instead of base commit ")
+
             counter_valid = 0
             for file in files:
                 if not is_valid_file(file.filename):
@@ -182,48 +201,36 @@ class GithubProvider(GitProvider):
                     continue
 
                 patch = file.patch
-
-                # allow only a limited number of files to be fully loaded. We can manage the rest with diffs only
-                counter_valid += 1
-                avoid_load = False
-                if counter_valid >= MAX_FILES_ALLOWED_FULL and patch and not self.incremental.is_incremental:
-                    avoid_load = True
-                    if counter_valid == MAX_FILES_ALLOWED_FULL:
-                        get_logger().info(f"Too many files in PR, will avoid loading full content for rest of files")
-
-                if avoid_load:
+                if is_close_to_rate_limit:
                     new_file_content_str = ""
+                    original_file_content_str = ""
                 else:
-                    new_file_content_str = self._get_pr_file_content(file, self.pr.head.sha)  # communication with GitHub
+                    # allow only a limited number of files to be fully loaded. We can manage the rest with diffs only
+                    counter_valid += 1
+                    avoid_load = False
+                    if counter_valid >= MAX_FILES_ALLOWED_FULL and patch and not self.incremental.is_incremental:
+                        avoid_load = True
+                        if counter_valid == MAX_FILES_ALLOWED_FULL:
+                            get_logger().info(f"Too many files in PR, will avoid loading full content for rest of files")
 
-                if self.incremental.is_incremental and self.unreviewed_files_set:
-                    original_file_content_str = self._get_pr_file_content(file, self.incremental.last_seen_commit_sha)
-                    patch = load_large_diff(file.filename, new_file_content_str, original_file_content_str)
-                    self.unreviewed_files_set[file.filename] = patch
-                else:
                     if avoid_load:
-                        original_file_content_str = ""
+                        new_file_content_str = ""
                     else:
-                        # The base.sha will point to the current state of the base branch (including parallel merges), not the original base commit when the PR was created
-                        # We can fix this by finding the merge base commit between the PR head and base branches
-                        # Note that The pr.head.sha is actually correct as is - it points to the latest commit in your PR branch.
-                        # This SHA isn't affected by parallel merges to the base branch since it's specific to your PR's branch.
-                        repo = self.repo_obj
-                        pr = self.pr
-                        try:
-                            compare = repo.compare(pr.base.sha, pr.head.sha)
-                            merge_base_commit = compare.merge_base_commit
-                        except Exception as e:
-                            get_logger().error(f"Failed to get merge base commit: {e}")
-                            merge_base_commit = pr.base
-                        if merge_base_commit.sha != pr.base.sha:
-                            get_logger().info(
-                                f"Using merge base commit {merge_base_commit.sha} instead of base commit "
-                                f"{pr.base.sha} for {file.filename}")
-                        original_file_content_str = self._get_pr_file_content(file, merge_base_commit.sha)
+                        new_file_content_str = self._get_pr_file_content(file, self.pr.head.sha)  # communication with GitHub
 
-                    if not patch:
+                    if self.incremental.is_incremental and self.unreviewed_files_set:
+                        original_file_content_str = self._get_pr_file_content(file, self.incremental.last_seen_commit_sha)
                         patch = load_large_diff(file.filename, new_file_content_str, original_file_content_str)
+                        self.unreviewed_files_set[file.filename] = patch
+                    else:
+                        if avoid_load:
+                            original_file_content_str = ""
+                        else:
+                            original_file_content_str = self._get_pr_file_content(file, merge_base_commit.sha)
+                            # original_file_content_str = self._get_pr_file_content(file, self.pr.base.sha)
+                        if not patch:
+                            patch = load_large_diff(file.filename, new_file_content_str, original_file_content_str)
+
 
                 if file.status == 'added':
                     edit_type = EDIT_TYPE.ADDED
@@ -238,9 +245,14 @@ class GithubProvider(GitProvider):
                     edit_type = EDIT_TYPE.UNKNOWN
 
                 # count number of lines added and removed
-                patch_lines = patch.splitlines(keepends=True)
-                num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
-                num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
+                if hasattr(file, 'additions') and hasattr(file, 'deletions'):
+                    num_plus_lines = file.additions
+                    num_minus_lines = file.deletions
+                else:
+                    patch_lines = patch.splitlines(keepends=True)
+                    num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
+                    num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
+
                 file_patch_canonical_structure = FilePatchInfo(original_file_content_str, new_file_content_str, patch,
                                                                file.filename, edit_type=edit_type,
                                                                num_plus_lines=num_plus_lines,
@@ -465,8 +477,17 @@ class GithubProvider(GitProvider):
             return False
 
     def edit_comment(self, comment, body: str):
-        body = self.limit_output_characters(body, self.max_comment_chars)
-        comment.edit(body=body)
+        try:
+            body = self.limit_output_characters(body, self.max_comment_chars)
+            comment.edit(body=body)
+        except GithubException as e:
+            if hasattr(e, "status") and e.status == 403:
+                # Log as warning for permission-related issues (usually due to polling)
+                get_logger().warning(
+                    "Failed to edit github comment due to permission restrictions",
+                    artifact={"error": e})
+            else:
+                get_logger().exception(f"Failed to edit github comment", artifact={"error": e})
 
     def edit_comment_from_comment_id(self, comment_id: int, body: str):
         try:
@@ -868,6 +889,84 @@ class GithubProvider(GitProvider):
         except:
             return ""
 
+    def fetch_sub_issues(self, issue_url):
+        """
+        Fetch sub-issues linked to the given GitHub issue URL using GraphQL via PyGitHub.
+        """
+        sub_issues = set()
+
+        # Extract owner, repo, and issue number from URL
+        parts = issue_url.rstrip("/").split("/")
+        owner, repo, issue_number = parts[-4], parts[-3], parts[-1]
+
+        try:
+            # Gets Issue ID from Issue Number
+            query = f"""
+            query {{
+                repository(owner: "{owner}", name: "{repo}") {{
+                    issue(number: {issue_number}) {{
+                        id
+                    }}
+                }}
+            }}
+            """
+            response_tuple = self.github_client._Github__requester.requestJson("POST", "/graphql",
+                                                                               input={"query": query})
+
+            # Extract the JSON response from the tuple and parses it
+            if isinstance(response_tuple, tuple) and len(response_tuple) == 3:
+                response_json = json.loads(response_tuple[2])
+            else:
+                get_logger().error(f"Unexpected response format: {response_tuple}")
+                return sub_issues
+
+
+            issue_id = response_json.get("data", {}).get("repository", {}).get("issue", {}).get("id")
+
+            if not issue_id:
+                get_logger().warning(f"Issue ID not found for {issue_url}")
+                return sub_issues
+
+            # Fetch Sub-Issues
+            sub_issues_query = f"""
+            query {{
+                node(id: "{issue_id}") {{
+                    ... on Issue {{
+                        subIssues(first: 10) {{
+                            nodes {{
+                                url
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+            """
+            sub_issues_response_tuple = self.github_client._Github__requester.requestJson("POST", "/graphql", input={
+                "query": sub_issues_query})
+
+            # Extract the JSON response from the tuple and parses it
+            if isinstance(sub_issues_response_tuple, tuple) and len(sub_issues_response_tuple) == 3:
+                sub_issues_response_json = json.loads(sub_issues_response_tuple[2])
+            else:
+                get_logger().error("Unexpected sub-issues response format", artifact={"response": sub_issues_response_tuple})
+                return sub_issues
+
+            if not sub_issues_response_json.get("data", {}).get("node", {}).get("subIssues"):
+                get_logger().error("Invalid sub-issues response structure")
+                return sub_issues
+    
+            nodes = sub_issues_response_json.get("data", {}).get("node", {}).get("subIssues", {}).get("nodes", [])
+            get_logger().info(f"Github Sub-issues fetched: {len(nodes)}", artifact={"nodes": nodes})
+
+            for sub_issue in nodes:
+                if "url" in sub_issue:
+                    sub_issues.add(sub_issue["url"])
+
+        except Exception as e:
+            get_logger().exception(f"Failed to fetch sub-issues. Error: {e}")
+
+        return sub_issues
+
     def auto_approve(self) -> bool:
         try:
             res = self.pr.create_review(event="APPROVE")
@@ -890,18 +989,7 @@ class GithubProvider(GitProvider):
         RE_HUNK_HEADER = re.compile(
             r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)")
 
-        # map file extensions to programming languages
-        language_extension_map_org = get_settings().language_extension_map_org
-        extension_to_language = {}
-        for language, extensions in language_extension_map_org.items():
-            for ext in extensions:
-                extension_to_language[ext] = language
-        for file in diff_files:
-            extension_s = '.' + file.filename.rsplit('.')[-1]
-            language_name = "txt"
-            if extension_s and (extension_s in extension_to_language):
-                language_name = extension_to_language[extension_s]
-            file.language = language_name.lower()
+        diff_files = set_file_languages(diff_files)
 
         for suggestion in code_suggestions_copy:
             try:

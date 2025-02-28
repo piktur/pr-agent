@@ -183,6 +183,7 @@ class AzureDevopsProvider(GitProvider):
         return True
 
     def set_pr(self, pr_url: str):
+        self.pr_url = pr_url
         self.workspace_slug, self.repo_slug, self.pr_num = self._parse_pr_url(pr_url)
         self.pr = self._get_pr()
 
@@ -326,13 +327,13 @@ class AzureDevopsProvider(GitProvider):
                     edit_type = EDIT_TYPE.ADDED
                 elif diff_types[file] == "delete":
                     edit_type = EDIT_TYPE.DELETED
-                elif diff_types[file] == "rename":
+                elif "rename" in diff_types[file]: # diff_type can be `rename` | `edit, rename`
                     edit_type = EDIT_TYPE.RENAMED
 
                 version = GitVersionDescriptor(
                     version=base_sha.commit_id, version_type="commit"
                 )
-                if edit_type == EDIT_TYPE.ADDED:
+                if edit_type == EDIT_TYPE.ADDED or edit_type == EDIT_TYPE.RENAMED:
                     original_file_content_str = ""
                 else:
                     try:
@@ -614,8 +615,11 @@ class AzureDevopsProvider(GitProvider):
             return pr_id
         except Exception as e:
             if get_settings().config.verbosity_level >= 2:
-                get_logger().error(f"Failed to get pr id, error: {e}")
+                get_logger().info(f"Failed to get pr id, error: {e}")
             return ""
 
     def publish_file_comments(self, file_comments: list) -> bool:
         pass
+
+    def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
+        return self.pr_url+f"?_a=files&path={relevant_file}"

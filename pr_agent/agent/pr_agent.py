@@ -3,6 +3,7 @@ from functools import partial
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.cli_args import CliArgs
 from pr_agent.algo.utils import update_settings_from_args
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.utils import apply_repo_settings
@@ -13,7 +14,6 @@ from pr_agent.tools.pr_config import PRConfig
 from pr_agent.tools.pr_description import PRDescription
 from pr_agent.tools.pr_generate_labels import PRGenerateLabels
 from pr_agent.tools.pr_help_message import PRHelpMessage
-from pr_agent.tools.pr_information_from_user import PRInformationFromUser
 from pr_agent.tools.pr_line_questions import PR_LineQuestions
 from pr_agent.tools.pr_questions import PRQuestions
 from pr_agent.tools.pr_reviewer import PRReviewer
@@ -25,8 +25,6 @@ command2class = {
     "answer": PRReviewer,
     "review": PRReviewer,
     "review_pr": PRReviewer,
-    "reflect": PRInformationFromUser,
-    "reflect_and_review": PRInformationFromUser,
     "describe": PRDescription,
     "describe_pr": PRDescription,
     "improve": PRCodeSuggestions,
@@ -46,10 +44,10 @@ command2class = {
 commands = list(command2class.keys())
 
 
+
 class PRAgent:
     def __init__(self, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         self.ai_handler = ai_handler  # will be initialized in run_action
-        self.forbidden_cli_args = ['enable_auto_approval']
 
     async def handle_request(self, pr_url, request, notify=None) -> bool:
         # First, apply repo specific settings if exists
@@ -64,24 +62,37 @@ class PRAgent:
         else:
             action, *args = request
 
-        if args:
-            for forbidden_arg in self.forbidden_cli_args:
-                for arg in args:
-                    if forbidden_arg in arg:
-                        get_logger().error(
-                            f"CLI argument for param '{forbidden_arg}' is forbidden. Use instead a configuration file."
-                        )
-                        return False
+        # validate args
+        is_valid, arg = CliArgs.validate_user_args(args)
+        if not is_valid:
+            get_logger().error(
+                f"CLI argument for param '{arg}' is forbidden. Use instead a configuration file."
+            )
+            return False
+
+        # Update settings from args
         args = update_settings_from_args(args)
+
+        # Append the response language in the extra instructions
+        response_language = get_settings().config.get('response_language', 'en-us')
+        if response_language.lower() != 'en-us':
+            get_logger().info(f'User has set the response language to: {response_language}')
+            for key in get_settings():
+                setting = get_settings().get(key)
+                if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
+                    if hasattr(setting, 'extra_instructions'):
+                        current_extra_instructions = setting.extra_instructions
+                        if current_extra_instructions:
+                            setting.extra_instructions = current_extra_instructions+ f"\n======\n\nIn addition, Your response MUST be written in the language corresponding to local code: {response_language}. This is crucial."
+                        else:
+                            setting.extra_instructions = f"Your response MUST be written in the language corresponding to locale code: '{response_language}'. This is crucial."
 
         action = action.lstrip("/").lower()
         if action not in command2class:
-            get_logger().debug(f"Unknown command: {action}")
+            get_logger().error(f"Unknown command: {action}")
             return False
         with get_logger().contextualize(command=action, pr_url=pr_url):
             get_logger().info("PR-Agent request handler started", analytics=True)
-            if action == "reflect_and_review":
-                get_settings().pr_reviewer.ask_and_reflect = True
             if action == "answer":
                 if notify:
                     notify()

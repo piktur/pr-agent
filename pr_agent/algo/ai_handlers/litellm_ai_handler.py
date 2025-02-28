@@ -6,9 +6,12 @@ import requests
 from litellm import acompletion
 from tenacity import retry, retry_if_exception_type, stop_after_attempt
 
+from pr_agent.algo import NO_SUPPORT_TEMPERATURE_MODELS, SUPPORT_REASONING_EFFORT_MODELS, USER_MESSAGE_ONLY_MODELS
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.utils import ReasoningEffort, get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
+import json
 
 OPENAI_RETRIES = 5
 
@@ -89,6 +92,19 @@ class LiteLLMAIHandler(BaseAiHandler):
         if get_settings().get("GOOGLE_AI_STUDIO.GEMINI_API_KEY", None):
           os.environ["GEMINI_API_KEY"] = get_settings().google_ai_studio.gemini_api_key
 
+        # Support deepseek models
+        if get_settings().get("DEEPSEEK.KEY", None):
+            os.environ['DEEPSEEK_API_KEY'] = get_settings().get("DEEPSEEK.KEY")
+
+        # Models that only use user meessage
+        self.user_message_only_models = USER_MESSAGE_ONLY_MODELS
+
+        # Model that doesn't support temperature argument
+        self.no_support_temperature_models = NO_SUPPORT_TEMPERATURE_MODELS
+
+        # Models that support reasoning effort
+        self.support_reasoning_models = SUPPORT_REASONING_EFFORT_MODELS
+
     def prepare_logs(self, response, system, user, resp, finish_reason):
         response_log = response.dict().copy()
         response_log['system'] = system
@@ -132,7 +148,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         if "langfuse" in callbacks:
             metadata.update({
                 "trace_name": command,
-                "tags": [git_provider, command],
+                "tags": [git_provider, command, f'version:{get_version()}'],
                 "trace_metadata": {
                     "command": command,
                     "pr_url": pr_url,
@@ -141,7 +157,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         if "langsmith" in callbacks:
             metadata.update({
                 "run_name": command,
-                "tags": [git_provider, command],
+                "tags": [git_provider, command, f'version:{get_version()}'],
                 "extra": {
                     "metadata": {
                         "command": command,
@@ -192,13 +208,11 @@ class LiteLLMAIHandler(BaseAiHandler):
                 messages[1]["content"] = [{"type": "text", "text": messages[1]["content"]},
                                           {"type": "image_url", "image_url": {"url": img_path}}]
 
-            # Currently O1 does not support separate system and user prompts
-            O1_MODEL_PREFIX = 'o1-'
-            model_type = model.split('/')[-1] if '/' in model else model
-            if model_type.startswith(O1_MODEL_PREFIX):
+            # Currently, some models do not support a separate system and user prompts
+            if model in self.user_message_only_models or get_settings().config.custom_reasoning_model:
                 user = f"{system}\n\n\n{user}"
                 system = ""
-                get_logger().info(f"Using O1 model, combining system and user prompts")
+                get_logger().info(f"Using model {model}, combining system and user prompts")
                 messages = [{"role": "user", "content": user}]
                 kwargs = {
                     "model": model,
@@ -212,10 +226,21 @@ class LiteLLMAIHandler(BaseAiHandler):
                     "model": model,
                     "deployment_id": deployment_id,
                     "messages": messages,
-                    "temperature": temperature,
                     "timeout": get_settings().config.ai_timeout,
                     "api_base": self.api_base,
                 }
+
+            # Add temperature only if model supports it
+            if model not in self.no_support_temperature_models and not get_settings().config.custom_reasoning_model:
+                # get_logger().info(f"Adding temperature with value {temperature} to model {model}.")
+                kwargs["temperature"] = temperature
+
+            # Add reasoning_effort if model supports it
+            if (model in self.support_reasoning_models):
+                supported_reasoning_efforts = [ReasoningEffort.HIGH.value, ReasoningEffort.MEDIUM.value, ReasoningEffort.LOW.value]
+                reasoning_effort = get_settings().config.reasoning_effort if (get_settings().config.reasoning_effort in supported_reasoning_efforts) else ReasoningEffort.MEDIUM.value
+                get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
+                kwargs["reasoning_effort"] = reasoning_effort
 
             if get_settings().litellm.get("enable_callbacks", False):
                 kwargs = self.add_litellm_callbacks(kwargs)
@@ -230,12 +255,22 @@ class LiteLLMAIHandler(BaseAiHandler):
             if self.repetition_penalty:
                 kwargs["repetition_penalty"] = self.repetition_penalty
 
+            #Added support for extra_headers while using litellm to call underlying model, via a api management gateway, would allow for passing custom headers for security and authorization
+            if get_settings().get("LITELLM.EXTRA_HEADERS", None):
+                try:
+                    litellm_extra_headers = json.loads(get_settings().litellm.extra_headers)
+                    if not isinstance(litellm_extra_headers, dict):
+                        raise ValueError("LITELLM.EXTRA_HEADERS must be a JSON object")
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"LITELLM.EXTRA_HEADERS contains invalid JSON: {str(e)}")
+                kwargs["extra_headers"] = litellm_extra_headers
+            
             get_logger().debug("Prompts", artifact={"system": system, "user": user})
-
+            
             if get_settings().config.verbosity_level >= 2:
                 get_logger().info(f"\nSystem prompt:\n{system}")
                 get_logger().info(f"\nUser prompt:\n{user}")
-
+                
             response = await acompletion(**kwargs)
         except (openai.APIError, openai.APITimeoutError) as e:
             get_logger().warning(f"Error during LLM inference: {e}")
