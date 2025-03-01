@@ -29,8 +29,8 @@ aws sso login --profile=production --sso-session=piktur
 aws ecr get-login-password --region "$(aws configure get region)" | docker login $AWS_REGISTRY -u AWS --password-stdin
 
 # Create repository if it doesn't exist
-aws ecr describe-repositories --repository-names $IMAGE_SUFFIX 2>/dev/null || 
-aws ecr create-repository --repository-name $IMAGE_SUFFIX
+aws ecr describe-repositories --repository-names $IMAGE_SUFFIX 2>/dev/null ||
+aws ecr create-repository --repository-name $IMAGE_SUFFIX 2>/dev/null
 
 IMAGE_NAME=$REGISTRY/$IMAGE_SUFFIX
 
@@ -40,7 +40,7 @@ export BUILDKIT_PROGRESS=plain
 
 log "Building $PACKAGE_NAME v$VERSION..."
 
-docker pull $IMAGE_NAME:serverless || true
+docker pull $IMAGE_NAME:serverless
 
 docker build \
     --platform linux/amd64 \
